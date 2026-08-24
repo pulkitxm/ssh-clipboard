@@ -1,26 +1,29 @@
+mod client;
+mod runtime;
+
 use std::collections::HashMap;
-use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
-use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::clipboard::{ClipboardBackend, NativeClipboard};
-use crate::config::{Config, PeerConfig, detected_machine_name, ensure_private_dir, paths};
+use crate::clipboard::ClipboardBackend;
+use crate::config::{Config, detected_machine_name};
 use crate::filebundle;
 use crate::model::{Clip, Direction, MonitorEvent};
 use crate::protocol::{Message, read_message, write_clip, write_message};
-use crate::ssh;
 use crate::update::{self, CURRENT_VERSION};
+
+pub use client::{bridge, connect_monitor, notify_updates, query_status};
+pub use runtime::run;
+#[cfg(test)]
+use runtime::{handle_local, remove_stale_socket};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerStatus {
@@ -400,283 +403,10 @@ async fn next_clipboard_change(
     interval.tick().await;
 }
 
-pub async fn run(config: Config) -> Result<()> {
-    let clipboard = Arc::new(NativeClipboard::new(config.max_bytes)?);
-    let paths = paths()?;
-    let (desired_version, _) = watch::channel(update::initial_desired_version());
-    let (update_hints, hint_receiver) = mpsc::unbounded_channel();
-    let update_desired = desired_version.clone();
-    let shutdown = async move {
-        tokio::select! {
-            () = shutdown_signal() => {}
-            version = update::run_auto_updates(update_desired, hint_receiver) => {
-                info!(%version, "automatic update installed; requesting an explicit service restart");
-                if let Err(error) = crate::service::control(crate::service::Action::Restart).await {
-                    warn!(%error, %version, "explicit service restart failed; falling back to a clean daemon exit");
-                }
-            }
-        }
-    };
-    run_daemon(
-        config,
-        clipboard,
-        paths.socket,
-        shutdown,
-        desired_version,
-        update_hints,
-    )
-    .await
-}
-
-async fn run_daemon<F>(
-    config: Config,
-    clipboard: Arc<dyn ClipboardBackend>,
-    socket: PathBuf,
-    shutdown: F,
-    desired_version: watch::Sender<String>,
-    update_hints: mpsc::UnboundedSender<String>,
-) -> Result<()>
-where
-    F: Future<Output = ()>,
-{
-    if let Some(parent) = socket.parent() {
-        ensure_private_dir(parent)?;
-    }
-    remove_stale_socket(&socket)?;
-    let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-    set_socket_permissions(&socket)?;
-    update::mark_healthy().await?;
-    let daemon = Daemon::with_updates(config, clipboard, desired_version, update_hints);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut tasks = JoinSet::new();
-    tasks.spawn(Arc::clone(&daemon).watch_clipboard(shutdown_rx.clone()));
-    tasks.spawn(accept_loop(Arc::clone(&daemon), listener, shutdown_rx.clone()));
-    for peer in daemon.config.peers.clone() {
-        tasks.spawn(dial_loop(Arc::clone(&daemon), peer, shutdown_rx.clone()));
-    }
-    info!(socket = %socket.display(), backend = daemon.clipboard.name(), "daemon ready");
-    shutdown.await;
-    let _ = shutdown_tx.send(true);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    let _ = tokio::fs::remove_file(&socket).await;
-    Ok(())
-}
-
-async fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener, mut shutdown: watch::Receiver<bool>) {
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    let daemon = Arc::clone(&daemon);
-                    let shutdown = shutdown.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = handle_local(daemon, stream, shutdown).await {
-                            debug!(%error, "local socket closed");
-                        }
-                    });
-                }
-                Err(error) => {
-                    warn!(%error, "local socket accept failed");
-                    return;
-                }
-            },
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-async fn handle_local(
-    daemon: Arc<Daemon>,
-    stream: UnixStream,
-    shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut buffered = BufReader::new(stream);
-    let mut command = String::new();
-    buffered.read_line(&mut command).await?;
-    match command.trim() {
-        "BRIDGE" => {
-            // Keep the buffered reader: the bridge command and the peer's hello can
-            // arrive in one socket read, and `into_inner` would discard those bytes.
-            let (mut reader, mut writer) = tokio::io::split(buffered);
-            daemon
-                .serve_peer(&mut reader, &mut writer, "incoming SSH", shutdown, None)
-                .await
-        }
-        "MONITOR" => serve_monitor(daemon, buffered.into_inner(), shutdown).await,
-        "STATUS" => {
-            let encoded = serde_json::to_vec(&daemon.status().await)?;
-            let mut stream = buffered.into_inner();
-            stream.write_all(&encoded).await?;
-            stream.write_all(b"\n").await?;
-            Ok(())
-        }
-        "NOTIFY_UPDATE" => {
-            let encoded = serde_json::to_vec(&daemon.notify_updates().await)?;
-            let mut stream = buffered.into_inner();
-            stream.write_all(&encoded).await?;
-            stream.write_all(b"\n").await?;
-            Ok(())
-        }
-        _ => bail!("unknown local socket command"),
-    }
-}
-
-async fn serve_monitor(
-    daemon: Arc<Daemon>,
-    mut stream: UnixStream,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut events = daemon.events.subscribe();
-    loop {
-        tokio::select! {
-            event = events.recv() => match event {
-                Ok(event) => {
-                    stream.write_all(&serde_json::to_vec(&event)?).await?;
-                    stream.write_all(b"\n").await?;
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            },
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-async fn dial_loop(daemon: Arc<Daemon>, peer: PeerConfig, mut shutdown: watch::Receiver<bool>) {
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        let established = AtomicBool::new(false);
-        let result = async {
-            let mut child = ssh::start_bridge(&peer.ssh_command)?;
-            let mut writer = child.stdin.take().context("SSH bridge stdin unavailable")?;
-            let mut reader = child.stdout.take().context("SSH bridge stdout unavailable")?;
-            let result = Arc::clone(&daemon)
-                .serve_peer(
-                    &mut reader,
-                    &mut writer,
-                    &peer.name,
-                    shutdown.clone(),
-                    Some(&established),
-                )
-                .await;
-            let _ = child.kill().await;
-            result
-        }
-        .await;
-        if established.load(Ordering::Acquire) {
-            backoff = Duration::from_secs(1);
-        }
-        if let Err(error) = result {
-            warn!(peer = %peer.name, %error, "peer connection failed");
-        }
-        tokio::select! {
-            () = tokio::time::sleep(backoff) => {
-                backoff = (backoff * 2).min(Duration::from_secs(10));
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-pub async fn bridge() -> Result<()> {
-    let socket = paths()?.socket;
-    let mut stream = UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("connect to daemon at {}", socket.display()))?;
-    stream.write_all(b"BRIDGE\n").await?;
-    let (mut socket_reader, mut socket_writer) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    tokio::select! {
-        result = tokio::io::copy(&mut stdin, &mut socket_writer) => { result?; }
-        result = tokio::io::copy(&mut socket_reader, &mut stdout) => { result?; }
-    }
-    Ok(())
-}
-
-pub async fn query_status() -> Result<Status> {
-    let socket = paths()?.socket;
-    let mut stream = UnixStream::connect(&socket).await?;
-    stream.write_all(b"STATUS\n").await?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).await?;
-    Ok(serde_json::from_str(&line)?)
-}
-
-pub async fn notify_updates() -> Result<UpdateNotification> {
-    let socket = paths()?.socket;
-    let mut stream = UnixStream::connect(&socket).await?;
-    stream.write_all(b"NOTIFY_UPDATE\n").await?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).await?;
-    Ok(serde_json::from_str(&line)?)
-}
-
-pub async fn connect_monitor() -> Result<BufReader<UnixStream>> {
-    let socket = paths()?.socket;
-    let mut stream = UnixStream::connect(&socket).await?;
-    stream.write_all(b"MONITOR\n").await?;
-    Ok(BufReader::new(stream))
-}
-
-fn remove_stale_socket(path: &Path) -> Result<()> {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return Ok(());
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        if !metadata.file_type().is_socket() {
-            bail!("refusing to replace non-socket path {}", path.display());
-        }
-    }
-    std::fs::remove_file(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_socket_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_socket_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
-}
-
 #[cfg(test)]
 mod tests {
-    use tokio::io::{duplex, split};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+    use tokio::net::UnixStream;
     use tokio::time::timeout;
 
     use super::*;

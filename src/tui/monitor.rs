@@ -1,5 +1,8 @@
+mod feeds;
+mod peer_version;
+
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,16 +12,16 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 use ratatui::{DefaultTerminal, Frame};
-use tokio::io::AsyncBufReadExt;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::config::Config;
-use crate::daemon::{self, PeerStatus, Status, UpdateNotification};
+use crate::daemon::{PeerStatus, Status, UpdateNotification};
 use crate::model::{Direction, MonitorEvent, human_bytes};
-use crate::update;
 
 use super::{ACCENT, CYAN, GREEN, MUTED, PANEL, RED, SOFT, YELLOW, clean_truncate};
+use feeds::{command_feed, monitor_feed, status_feed};
+use peer_version::{known_version, peer_target_version, peer_update_state, version_label};
 
 enum UiMessage {
     Event(MonitorEvent),
@@ -454,58 +457,6 @@ impl MonitorApp {
     }
 }
 
-fn version_label(version: Option<&str>) -> String {
-    version
-        .and_then(known_version)
-        .map_or_else(|| "unknown".into(), |version| format!("v{version}"))
-}
-
-fn known_version(version: &str) -> Option<&str> {
-    (!version.is_empty() && version != "legacy").then_some(version)
-}
-
-fn peer_target_version<'a>(
-    installed: Option<&str>,
-    peer_desired: Option<&'a str>,
-    local_desired: Option<&'a str>,
-) -> Option<&'a str> {
-    installed.and_then(known_version)?;
-    match (
-        peer_desired.and_then(known_version),
-        local_desired.and_then(known_version),
-    ) {
-        (Some(peer), Some(local)) if update::newer_version(peer, local) => Some(local),
-        (Some(peer), _) => Some(peer),
-        (None, local) => local,
-    }
-}
-
-fn peer_update_state(
-    connected: bool,
-    installed: Option<&str>,
-    peer_desired: Option<&str>,
-    local_desired: Option<&str>,
-) -> (&'static str, ratatui::style::Color) {
-    if !connected {
-        return ("offline", RED);
-    }
-    let Some(installed) = installed.and_then(known_version) else {
-        return ("version unknown · setup required", YELLOW);
-    };
-    let peer_desired = peer_desired.and_then(known_version);
-    let local_desired = local_desired.and_then(known_version);
-    if peer_desired.is_some_and(|desired| update::newer_version(installed, desired)) {
-        return ("updating", YELLOW);
-    }
-    if local_desired.is_some_and(|desired| update::newer_version(installed, desired)) {
-        return ("outdated · press u", YELLOW);
-    }
-    if local_desired.is_some_and(|desired| update::newer_version(desired, installed)) {
-        return ("ahead", CYAN);
-    }
-    ("current", GREEN)
-}
-
 fn panel(title: &'static str) -> Block<'static> {
     Block::new()
         .title(Line::styled(title, Style::new().fg(ACCENT).bold()))
@@ -550,89 +501,6 @@ fn key(value: &'static str) -> Span<'static> {
 
 fn muted(value: &'static str) -> Span<'static> {
     Span::styled(value, Style::new().fg(MUTED))
-}
-
-async fn monitor_feed(sender: Sender<UiMessage>, mut shutdown: watch::Receiver<bool>) {
-    loop {
-        match daemon::connect_monitor().await {
-            Ok(mut reader) => {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    tokio::select! {
-                        result = reader.read_line(&mut line) => match result {
-                            Ok(0) => break,
-                            Ok(_) => match serde_json::from_str::<MonitorEvent>(&line) {
-                                Ok(event) => { let _ = sender.send(UiMessage::Event(event)); }
-                                Err(error) => { let _ = sender.send(UiMessage::Error(error.to_string())); }
-                            },
-                            Err(error) => {
-                                let _ = sender.send(UiMessage::Error(error.to_string()));
-                                break;
-                            }
-                        },
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() { return; }
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                let _ = sender.send(UiMessage::Error(error.to_string()));
-            }
-        }
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(1)) => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() { return; }
-            }
-        }
-    }
-}
-
-async fn status_feed(sender: Sender<UiMessage>, mut shutdown: watch::Receiver<bool>) {
-    loop {
-        match daemon::query_status().await {
-            Ok(status) => {
-                let _ = sender.send(UiMessage::Status(status));
-            }
-            Err(error) => {
-                let _ = sender.send(UiMessage::Offline(error.to_string()));
-            }
-        }
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(1)) => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() { return; }
-            }
-        }
-    }
-}
-
-async fn command_feed(
-    sender: Sender<UiMessage>,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<MonitorCommand>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    loop {
-        tokio::select! {
-            command = commands.recv() => match command {
-                Some(MonitorCommand::NotifyUpdates) => {
-                    let message = match daemon::notify_updates().await {
-                        Ok(notification) => UiMessage::UpdateNotified(notification),
-                        Err(error) => UiMessage::UpdateFailed(error.to_string()),
-                    };
-                    let _ = sender.send(message);
-                }
-                None => return,
-            },
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
-            }
-        }
-    }
 }
 
 pub async fn run_monitor(config: Config) -> Result<()> {

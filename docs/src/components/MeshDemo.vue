@@ -9,95 +9,27 @@
 //   typed-for authorization code is copied and fans out the other way.
 // The center window is the `ssh-clipboard monitor` TUI logging it all.
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import {
+  ACTIVITY_ROWS as ROWS,
+  CAPTURE as CAP,
+  COLORS as C,
+  IMAGE_PREVIEW as IMG_PV,
+  LOOP,
+  MONO,
+  SCENE_H,
+  SCENE_W,
+  STAT_H,
+  TEXT_PREVIEW as TXT_PV,
+  TIMELINE as T,
+  inCubic,
+  meshLayout as layout,
+  outQuint,
+  seg,
+  trap,
+} from './demo/meshScene.js'
 
 const wrap = ref(null)
 const cv = ref(null)
-
-// Page-blending grays match the @theme block in src/style.css; the
-// scene colors below them are the illustration's own palette.
-const C = {
-  line: '#262626',
-  lineBright: '#3d3d3d',
-  bright: '#f2f2f2',
-  dim: '#8b8b8b',
-  faint: '#595959',
-  mint: '#4ee585',
-  tuiBg: '#13151b',
-  accent: '#a78bfa',
-  cyan: '#22d3ee',
-  green: '#34d399',
-  yellow: '#fbbf24',
-  muted: '#64748b',
-  soft: '#cbd5e1',
-  tuiPanel: '#3d3d3d', // same neutral gray as lineBright: one border color
-  chipBg: '#0f1620',
-  bg: '#000000',
-}
-
-const MONO = "ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace"
-const LOOP = 16000
-
-// ── timeline (fractions of the loop, matching the old keyframes) ──
-const clamp01 = (v) => Math.max(0, Math.min(1, v))
-const seg = (t, a, b) => clamp01((t - a) / (b - a))
-// snappy settle, like the old cubic-bezier(0.22,1,0.36,1) desk-pop
-const outQuint = (p) => 1 - (1 - p) ** 5
-const inCubic = (p) => p ** 3
-// hard attack / hold / hard release, like the old stepped glow keyframes
-const trap = (p) => (p <= 0 || p >= 1 ? 0 : Math.min(1, p / 0.12, (1 - p) / 0.18))
-
-// Every effect follows its cause within ~0.3s; the tail after the code is
-// accepted is the deliberate resting state before the loop wraps.
-const T = {
-  // beat A — screenshot on the mac, fans out to everyone.
-  // The mac desktop is already open at t=0 (it opened at deskD last loop,
-  // showing the accepted code) and closes after the capture.
-  sel: [0.04, 0.105], // selection marquee + crosshair drag
-  flash: [0.115, 0.132],
-  deskAClose: [0.132, 0.162], // the pane dismisses fully…
-  flyA: [0.168, 0.205], // …then the shot leaves the node along its wire
-  sentTotal: 0.267, // 3 × 8.8 MiB, once all three sends complete
-  fanA: [0.215, 0.265], // monitor → all three peers, together
-  recvA: [0.265, 0.32],
-  // beat A2 — debian uses the image, window closes, that's it
-  deskB: [0.285, 0.32, 0.445, 0.475],
-  // beat B — fedora types its own request, gets a response with a code
-  // (clear air after debian's pane is fully gone)
-  deskC: [0.495, 0.53, 0.716, 0.746],
-  hlC: [0.676, 0.706], // copy highlight sweep, then the pane dismisses
-  flyB: [0.75, 0.79], // code rides fedora's wire back to the monitor
-  recvTotal: 0.795,
-  fanB: [0.805, 0.855], // monitor → debian, mini, macbook, together
-  recvB: [0.855, 0.91],
-  // loop closure — the code lands, the mac desktop opens, the pointer
-  // clicks into the field, the paste accepts; that end state is frame one
-  deskD: [0.875, 0.908],
-  macPtr: [0.9, 0.945], // pointer travel to the authorization field
-  codeFill: 0.948,
-  fade: [0.955, 0.99],
-}
-
-const IMG_PV = '<Apple PNG past…'
-const TXT_PV = '01923091283'
-
-// Rows append downward as the story advances.
-const ROWS = [
-  // each row appears when its payload reaches the monitor pane
-  { at: 0.205, time: '41.204', flow: '◆ copied here', fc: C.accent, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
-  { at: 0.218, time: '41.530', flow: '→ fedora', fc: C.cyan, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
-  { at: 0.224, time: '41.530', flow: '→ debian', fc: C.cyan, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
-  { at: 0.23, time: '41.530', flow: '→ mini', fc: C.cyan, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
-  { at: 0.792, time: '47.214', flow: '← fedora', fc: C.green, pv: TXT_PV, size: '11 B', fm: '1' },
-  { at: 0.808, time: '47.215', flow: '→ debian', fc: C.cyan, pv: TXT_PV, size: '11 B', fm: '1' },
-  { at: 0.814, time: '47.215', flow: '→ mini', fc: C.cyan, pv: TXT_PV, size: '11 B', fm: '1' },
-  { at: 0.82, time: '47.215', flow: '→ macbook', fc: C.cyan, pv: TXT_PV, size: '11 B', fm: '1' },
-]
-
-// ── desktop scenes (fixed 440×292 local coordinate space) ─────────
-const SCENE_W = 440
-const SCENE_H = 292
-// screenshot capture region, in scene coords — frames the sunset photo
-const CAP = { x: 252, y: 102, w: 116, h: 90 }
 
 function rr(ctx, x, y, w, h, r) {
   ctx.beginPath()
@@ -448,98 +380,6 @@ const FED_SCENE = {
   replyAt: 0.625,
   codeAt: 0.633,
   hlWin: [0.676, 0.706],
-}
-
-// ── layout ────────────────────────────────────────────────────────
-function curve(p0, p1, vertical) {
-  const c1 = vertical
-    ? { x: p0.x, y: p0.y + (p1.y - p0.y) * 0.45 }
-    : { x: p0.x + (p1.x - p0.x) * 0.45, y: p0.y }
-  const c2 = vertical
-    ? { x: p1.x, y: p1.y - (p1.y - p0.y) * 0.45 }
-    : { x: p1.x - (p1.x - p0.x) * 0.45, y: p1.y }
-  return {
-    at(t) {
-      const u = 1 - t
-      return {
-        x: u * u * u * p0.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * p1.x,
-        y: u * u * u * p0.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * p1.y,
-      }
-    },
-    p0,
-    c1,
-    c2,
-    p1,
-  }
-}
-
-// reserved strip at the canvas bottom for the zero-callouts line
-const STAT_H = 48
-
-function monitorHeight(fs) {
-  const lh = fs * 1.62
-  return Math.round(14 * lh + 108)
-}
-
-function layout(w) {
-  const NW = 118
-  const NH = 96
-  const wide = w >= 620
-  const nodes = {}
-  let mon, fs, H, sceneScale
-  if (wide) {
-    const monW = Math.max(300, Math.min(470, w - 2 * NW - 4 * 26))
-    fs = Math.max(9, Math.min(12, monW / 40))
-    const monH = monitorHeight(fs)
-    const sceneH = Math.max(monH + 56, 476)
-    H = sceneH + STAT_H
-    mon = { x: (w - monW) / 2, y: (sceneH - monH) / 2 + 14, w: monW, h: monH }
-    nodes.macbook = { x: 8, y: sceneH - NH - 6, w: NW, h: NH }
-    const rx = w - NW - 8
-    const gap = (sceneH - 3 * NH) / 4
-    nodes.fedora = { x: rx, y: gap, w: NW, h: NH }
-    nodes.debian = { x: rx, y: gap * 2 + NH, w: NW, h: NH }
-    nodes.mini = { x: rx, y: gap * 3 + NH * 2, w: NW, h: NH }
-    sceneScale = Math.min(1, (w * 0.46) / SCENE_W)
-  } else {
-    const monW = Math.min(440, w - 8)
-    fs = Math.max(8.5, Math.min(11, monW / 40))
-    const monH = monitorHeight(fs)
-    const gap = 46
-    H = NH + gap + monH + gap + NH + 16 + STAT_H
-    mon = { x: (w - monW) / 2, y: NH + gap + 8, w: monW, h: monH }
-    nodes.macbook = { x: (w - NW) / 2, y: 8, w: NW, h: NH }
-    const bw = Math.min(NW, (w - 32) / 3)
-    const by = mon.y + monH + gap
-    const bgap = (w - 3 * bw) / 4
-    nodes.fedora = { x: bgap, y: by, w: bw, h: NH }
-    nodes.mini = { x: bgap * 2 + bw, y: by, w: bw, h: NH }
-    nodes.debian = { x: bgap * 3 + bw * 2, y: by, w: bw, h: NH }
-    sceneScale = Math.min(1, (w - 16) / SCENE_W)
-  }
-  const cx = (r) => r.x + r.w / 2
-  const cy = (r) => r.y + r.h / 2
-  const wires = {}
-  let deskARect, deskBRect
-  if (wide) {
-    wires.macbook = curve({ x: nodes.macbook.x + NW, y: cy(nodes.macbook) }, { x: mon.x, y: mon.y + mon.h * 0.72 }, false)
-    wires.fedora = curve({ x: mon.x + mon.w, y: mon.y + mon.h * 0.24 }, { x: nodes.fedora.x, y: cy(nodes.fedora) }, false)
-    wires.debian = curve({ x: mon.x + mon.w, y: mon.y + mon.h * 0.5 }, { x: nodes.debian.x, y: cy(nodes.debian) }, false)
-    wires.mini = curve({ x: mon.x + mon.w, y: mon.y + mon.h * 0.76 }, { x: nodes.mini.x, y: cy(nodes.mini) }, false)
-    deskARect = { x: 8, y: 8 }
-    deskBRect = { x: w - SCENE_W * sceneScale - 8, y: 8 }
-  } else {
-    wires.macbook = curve({ x: cx(nodes.macbook), y: nodes.macbook.y + nodes.macbook.h }, { x: cx(mon), y: mon.y }, true)
-    for (const n of ['fedora', 'mini', 'debian']) {
-      wires[n] = curve({ x: cx(nodes[n]), y: mon.y + mon.h }, { x: cx(nodes[n]), y: nodes[n].y }, true)
-    }
-    // narrow: pop-up desktops cover the monitor area cleanly
-    const dx = (w - SCENE_W * sceneScale) / 2
-    const dy = mon.y + (mon.h - SCENE_H * sceneScale) / 2
-    deskARect = { x: dx, y: dy }
-    deskBRect = { x: dx, y: dy }
-  }
-  return { w, H, fs, mon, nodes, wires, wide, sceneScale, deskARect, deskBRect }
 }
 
 // ── shared drawing helpers ────────────────────────────────────────

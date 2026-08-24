@@ -92,6 +92,7 @@ fn binary_candidates(current: &Path, os: &str, arch: &str, bundle_root: Option<&
 pub async fn install_remote<F>(
     ssh_command: &str,
     probe: &ProbeResult,
+    headless_x11: bool,
     mut progress: F,
 ) -> Result<service::InstallOutcome>
 where
@@ -125,14 +126,18 @@ where
     }
 
     progress("service", "Ensuring the per-user background service is available");
-    let output = ssh::run(
-        ssh_command,
-        r#"exec "$HOME/.local/bin/ssh-clipboard" service install --binary "$HOME/.local/bin/ssh-clipboard""#,
-    )
-    .await?;
+    let output = ssh::run(ssh_command, remote_service_install_command(headless_x11)).await?;
     let detail = String::from_utf8(output)?;
     service::InstallOutcome::from_detail(&detail)
         .context("remote service installer returned an unexpected result")
+}
+
+fn remote_service_install_command(headless_x11: bool) -> &'static str {
+    if headless_x11 {
+        r#"exec "$HOME/.local/bin/ssh-clipboard" service install --headless-x11 --binary "$HOME/.local/bin/ssh-clipboard""#
+    } else {
+        r#"exec "$HOME/.local/bin/ssh-clipboard" service install --binary "$HOME/.local/bin/ssh-clipboard""#
+    }
 }
 
 pub async fn inspect_remote(ssh_command: &str, probe: &ProbeResult) -> Result<Installation> {
@@ -223,7 +228,15 @@ pub async fn install_local_service() -> Result<service::InstallOutcome> {
     } else {
         install_local_binary(None).await?
     };
-    service::install(&binary).await
+    let headless_x11 = Config::load()?.headless_x11;
+    service::install(
+        &binary,
+        service::InstallOptions {
+            headless_x11,
+            reset_display: false,
+        },
+    )
+    .await
 }
 
 async fn binary_version(binary: &Path) -> Option<String> {
@@ -359,5 +372,11 @@ mod tests {
     fn rejects_truncated_installation_inspection() {
         let error = parse_installation("TOKEN\t0.2.1\t1\n", "TOKEN").unwrap_err();
         assert!(error.to_string().contains("service flag"));
+    }
+
+    #[test]
+    fn remote_headless_install_is_explicit() {
+        assert!(!remote_service_install_command(false).contains("--headless-x11"));
+        assert!(remote_service_install_command(true).contains("--headless-x11"));
     }
 }

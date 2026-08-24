@@ -62,6 +62,12 @@ enum ServiceAction {
     Install {
         #[arg(long)]
         binary: Option<PathBuf>,
+        /// Manage a private Xvfb display for a headless Linux machine
+        #[arg(long, conflicts_with = "native_display")]
+        headless_x11: bool,
+        /// Stop using the managed Xvfb display
+        #[arg(long, conflicts_with = "headless_x11")]
+        native_display: bool,
     },
     Start,
     Stop,
@@ -156,13 +162,33 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Service { action }) => match action {
-            ServiceAction::Install { binary } => {
+            ServiceAction::Install {
+                binary,
+                headless_x11,
+                native_display,
+            } => {
                 let binary = match binary {
                     Some(binary) => binary,
                     None => std::env::current_exe()?,
                 };
                 let binary = binary.canonicalize().context("resolve service binary")?;
-                let outcome = service::install(&binary).await?;
+                let mut config = if paths()?.config_file.exists() {
+                    Config::load()?
+                } else {
+                    Config::default()
+                };
+                if headless_x11 || native_display {
+                    config.headless_x11 = headless_x11;
+                    config.save()?;
+                }
+                let outcome = service::install(
+                    &binary,
+                    service::InstallOptions {
+                        headless_x11: config.headless_x11,
+                        reset_display: native_display,
+                    },
+                )
+                .await?;
                 println!("{}", outcome.detail());
                 Ok(())
             }

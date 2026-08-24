@@ -1,3 +1,5 @@
+mod installation;
+
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -10,12 +12,17 @@ use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::runtime::Handle;
 
-use crate::config::{Config, PeerConfig};
+use crate::config::Config;
+#[cfg(test)]
+use crate::config::PeerConfig;
 use crate::deploy;
 use crate::ssh::{self, ProbeResult};
 use crate::tailscale;
 
 use super::{ACCENT, CYAN, GREEN, MUTED, PANEL, RED, SOFT, clean_truncate};
+use installation::install_all;
+#[cfg(test)]
+use installation::merge_peer;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -35,6 +42,25 @@ struct VerifiedPeer {
     command: String,
     probe: ProbeResult,
     installation: deploy::Installation,
+    headless_x11: bool,
+}
+
+impl VerifiedPeer {
+    fn new(command: String, probe: ProbeResult, installation: deploy::Installation) -> Self {
+        Self {
+            command,
+            probe,
+            installation,
+            headless_x11: false,
+        }
+    }
+
+    fn headless_capability(&self) -> Option<&crate::ssh::LinuxClipboard> {
+        self.probe
+            .linux_clipboard
+            .as_ref()
+            .filter(|clipboard| clipboard.needs_display())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +177,22 @@ impl SetupApp {
                     self.stage = Stage::Entry;
                 }
                 KeyCode::Enter | KeyCode::Char('i') => self.begin_install(),
+                KeyCode::Char('x') => {
+                    let enable = self.peers.iter().any(|peer| {
+                        peer.headless_capability()
+                            .is_some_and(|clipboard| clipboard.xvfb_available)
+                            && !peer.headless_x11
+                    });
+                    for peer in &mut self.peers {
+                        if peer
+                            .headless_capability()
+                            .is_some_and(|clipboard| clipboard.xvfb_available)
+                        {
+                            peer.headless_x11 = enable;
+                        }
+                    }
+                    self.error = None;
+                }
                 _ => {}
             },
             Stage::Ready => match key.code {
@@ -245,11 +287,7 @@ impl SetupApp {
                     let installation = deploy::inspect_remote(&command, &probe)
                         .await
                         .with_context(|| format!("inspect {}", peer.hostname))?;
-                    verified.push(VerifiedPeer {
-                        command,
-                        probe,
-                        installation,
-                    });
+                    verified.push(VerifiedPeer::new(command, probe, installation));
                 }
                 Ok(verified)
             }
@@ -261,6 +299,29 @@ impl SetupApp {
 
     fn begin_install(&mut self) {
         if self.peers.is_empty() {
+            return;
+        }
+        if let Some(peer) = self.peers.iter().find(|peer| {
+            peer.headless_capability()
+                .is_some_and(|clipboard| !clipboard.xvfb_available)
+        }) {
+            let clipboard = peer.headless_capability().expect("headless peer");
+            self.error = Some(format!(
+                "{} has no graphical clipboard. Run `{}` there, then verify it again.",
+                peer.probe.hostname,
+                clipboard.install_hint()
+            ));
+            return;
+        }
+        if let Some(peer) = self
+            .peers
+            .iter()
+            .find(|peer| peer.headless_capability().is_some() && !peer.headless_x11)
+        {
+            self.error = Some(format!(
+                "{} has no graphical clipboard. Press x to enable managed Xvfb.",
+                peer.probe.hostname
+            ));
             return;
         }
         self.stage = Stage::Installing;
@@ -284,11 +345,7 @@ impl SetupApp {
             UiMessage::Verified { command, result } => match result {
                 Ok((probe, installation)) => {
                     if !self.peers.iter().any(|peer| peer.command == command) {
-                        self.peers.push(VerifiedPeer {
-                            command,
-                            probe,
-                            installation,
-                        });
+                        self.peers.push(VerifiedPeer::new(command, probe, installation));
                     }
                     self.last_verified = 1;
                     self.stage = Stage::Confirmed;
@@ -392,7 +449,9 @@ impl SetupApp {
                     + u16::from(self.error.is_some()) * 2
                     + u16::from(!self.peers.is_empty()) * 2
             }
-            Stage::Welcome | Stage::Verifying | Stage::Confirmed | Stage::Failed => 12,
+            Stage::Confirmed => 12_u16
+                .saturating_add(u16::try_from(self.confirmed_headless_lines().len()).unwrap_or(u16::MAX)),
+            Stage::Welcome | Stage::Verifying | Stage::Failed => 12,
             Stage::Installing | Stage::Ready => 14,
         }
     }
@@ -524,9 +583,9 @@ impl SetupApp {
             ]),
             Stage::Confirmed => {
                 let verified_count = self.last_verified.max(1).min(self.peers.len());
-                if verified_count == 1 {
+                let mut lines = if verified_count == 1 {
                     let peer = self.peers.last().expect("confirmed stage has a peer");
-                    Text::from(vec![
+                    vec![
                         Line::styled("✓  Connection verified", Style::new().fg(GREEN).bold()),
                         Line::raw(""),
                         Line::from(vec![
@@ -543,14 +602,14 @@ impl SetupApp {
                             "The host is reachable without a password and ready.",
                             Style::new().fg(SOFT),
                         ),
-                    ])
+                    ]
                 } else {
                     let names = self.peers[self.peers.len() - verified_count..]
                         .iter()
                         .map(|peer| format!("{} ({})", peer.probe.hostname, peer.installation.summary()))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    Text::from(vec![
+                    vec![
                         Line::styled(
                             format!("✓  {verified_count} connections verified"),
                             Style::new().fg(GREEN).bold(),
@@ -562,8 +621,10 @@ impl SetupApp {
                             "The selected hosts are reachable without a password and ready for installation.",
                             Style::new().fg(SOFT),
                         ),
-                    ])
-                }
+                    ]
+                };
+                lines.extend(self.confirmed_headless_lines());
+                Text::from(lines)
             }
             Stage::Ready => {
                 let pending = self
@@ -680,6 +741,35 @@ impl SetupApp {
         Text::from(lines)
     }
 
+    fn confirmed_headless_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for peer in &self.peers {
+            let Some(clipboard) = peer.headless_capability() else {
+                continue;
+            };
+            lines.push(Line::raw(""));
+            if clipboard.xvfb_available {
+                let mark = if peer.headless_x11 { "[✓]" } else { "[ ]" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{mark} Managed Xvfb  "), Style::new().fg(CYAN).bold()),
+                    Span::styled(
+                        format!("{} · private display :99", peer.probe.hostname),
+                        Style::new().fg(MUTED),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("Xvfb required  ", Style::new().fg(RED).bold()),
+                    Span::styled(clipboard.install_hint(), Style::new().fg(SOFT)),
+                ]));
+            }
+        }
+        if let Some(error) = &self.error {
+            lines.push(Line::styled(clean_truncate(error, 88), Style::new().fg(RED)));
+        }
+        lines
+    }
+
     fn render_installing(&self, frame: &mut Frame, area: Rect) {
         let [heading, list, gauge, note] = Layout::vertical([
             Constraint::Length(2),
@@ -739,6 +829,12 @@ impl SetupApp {
                 ("enter", "verify / install"),
                 ("ctrl+c", "quit"),
             ],
+            Stage::Confirmed if self.peers.iter().any(|peer| peer.headless_capability().is_some()) => &[
+                ("x", "toggle Xvfb"),
+                ("enter", "install"),
+                ("a", "add another"),
+                ("ctrl+c", "quit"),
+            ],
             Stage::Confirmed => &[("enter", "install"), ("a", "add another"), ("ctrl+c", "quit")],
             Stage::Installing | Stage::Verifying => &[("ctrl+c", "cancel")],
             Stage::Ready => &[
@@ -760,61 +856,6 @@ impl SetupApp {
     }
 }
 
-async fn install_all(config: Config, peers: Vec<VerifiedPeer>, sender: Sender<UiMessage>) -> Result<()> {
-    let mut local = config;
-    for peer in &peers {
-        merge_peer(
-            &mut local.peers,
-            PeerConfig {
-                name: peer.probe.hostname.clone(),
-                ssh_command: peer.command.clone(),
-            },
-        );
-    }
-    local.save()?;
-    for peer in &peers {
-        let name = peer.probe.hostname.clone();
-        let progress_sender = sender.clone();
-        let outcome = deploy::install_remote(&peer.command, &peer.probe, |_, detail| {
-            let _ = progress_sender.send(UiMessage::Progress {
-                peer: name.clone(),
-                detail: detail.to_owned(),
-                complete: false,
-            });
-        })
-        .await
-        .with_context(|| format!("install {name}"))?;
-        let _ = sender.send(UiMessage::Progress {
-            peer: name,
-            detail: outcome.detail().into(),
-            complete: true,
-        });
-    }
-    let _ = sender.send(UiMessage::Progress {
-        peer: local.node_name.clone(),
-        detail: "Installing this machine’s service".into(),
-        complete: false,
-    });
-    let outcome = deploy::install_local_service().await?;
-    let _ = sender.send(UiMessage::Progress {
-        peer: local.node_name,
-        detail: outcome.detail().into(),
-        complete: true,
-    });
-    Ok(())
-}
-
-fn merge_peer(peers: &mut Vec<PeerConfig>, configured: PeerConfig) {
-    if let Some(existing) = peers
-        .iter_mut()
-        .find(|existing| existing.ssh_command == configured.ssh_command || existing.name == configured.name)
-    {
-        *existing = configured;
-    } else {
-        peers.push(configured);
-    }
-}
-
 pub async fn run_setup(config: Config) -> Result<()> {
     let handle = Handle::current();
     tokio::task::spawn_blocking(move || ratatui::run(|terminal| SetupApp::new(handle, config).run(terminal)))
@@ -824,219 +865,4 @@ pub async fn run_setup(config: Config) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    use super::*;
-
-    #[test]
-    fn welcome_screen_renders_key_promises() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let app = SetupApp::new(runtime.handle().clone(), Config::default());
-        let backend = TestBackend::new(100, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(rendered.contains("Your clipboard, without borders"));
-        assert!(rendered.contains("No cloud account"));
-        assert!(rendered.contains("No conversion"));
-    }
-
-    #[test]
-    fn entry_screen_renders_verification_error_without_controls() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
-        app.stage = Stage::Entry;
-        app.error = Some("bad\u{1b}[31m connection".into());
-        let backend = TestBackend::new(100, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(rendered.contains("Couldn’t verify"));
-        assert!(!rendered.contains('\u{1b}'));
-    }
-
-    #[test]
-    fn entry_screen_shows_a_complete_command_without_a_fake_prefix() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
-        app.stage = Stage::Entry;
-        let backend = TestBackend::new(100, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(rendered.contains("command  ssh macbookserver"));
-        assert!(!rendered.contains("ssh  macbookserver"));
-    }
-
-    #[test]
-    fn entry_screen_offers_discovered_tailscale_machines_as_a_checklist() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
-        app.stage = Stage::Entry;
-        app.on_message(UiMessage::TailscaleDiscovered(vec![
-            tailscale::Peer {
-                hostname: "Studio Mac".into(),
-                dns_name: "studio.example.ts.net".into(),
-                os: "macOS".into(),
-            },
-            tailscale::Peer {
-                hostname: "server".into(),
-                dns_name: "server.example.ts.net".into(),
-                os: "Linux".into(),
-            },
-        ]));
-
-        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-
-        let backend = TestBackend::new(100, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-
-        assert!(app.tailscale_choices[0].selected);
-        assert_eq!(app.tailscale_cursor, 1);
-        assert!(rendered.contains("Select online machines from your Tailscale network"));
-        assert!(rendered.contains("[✓] Studio Mac"));
-        assert!(rendered.contains("[ ] server"));
-        assert!(rendered.contains("Or paste a passwordless SSH command"));
-        assert!(app.help().to_string().contains("space select"));
-    }
-
-    #[test]
-    fn confirmed_actions_stay_next_to_the_verified_peer() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
-        app.stage = Stage::Confirmed;
-        app.peers.push(VerifiedPeer {
-            command: "ssh macbookserver".into(),
-            probe: ProbeResult {
-                os: "darwin".into(),
-                arch: "arm64".into(),
-                home: "/Users/me".into(),
-                hostname: "MacBookPro.home.local".into(),
-            },
-            installation: deploy::Installation {
-                version: None,
-                config_exists: false,
-                service_exists: false,
-                running: false,
-            },
-        });
-        let backend = TestBackend::new(100, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let rows = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(100)
-            .map(|cells| {
-                cells
-                    .iter()
-                    .map(ratatui::buffer::Cell::symbol)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        let verified_row = rows.iter().position(|row| row.contains("Not installed")).unwrap();
-        let actions_row = rows.iter().position(|row| row.contains("enter install")).unwrap();
-        assert!(actions_row > verified_row);
-        assert!(actions_row - verified_row <= 6);
-        assert!(actions_row < rows.len() / 2);
-    }
-
-    #[test]
-    fn ready_screen_can_add_another_peer_without_forgetting_existing_peers() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
-        app.stage = Stage::Ready;
-        app.input = "stale input".into();
-        app.error = Some("stale error".into());
-        app.peers.push(VerifiedPeer {
-            command: "ssh macbookserver".into(),
-            probe: ProbeResult {
-                os: "darwin".into(),
-                arch: "arm64".into(),
-                home: "/Users/me".into(),
-                hostname: "MacBookPro.home.local".into(),
-            },
-            installation: deploy::Installation {
-                version: Some(crate::update::CURRENT_VERSION.into()),
-                config_exists: true,
-                service_exists: true,
-                running: true,
-            },
-        });
-
-        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-
-        assert_eq!(app.stage, Stage::Entry);
-        assert!(app.input.is_empty());
-        assert!(app.error.is_none());
-        assert_eq!(app.peers.len(), 1);
-        assert_eq!(app.peers[0].command, "ssh macbookserver");
-        assert!(app.help().to_string().contains("enter verify / install"));
-    }
-
-    #[test]
-    fn setup_merges_peers_without_erasing_existing_connections() {
-        let mut peers = vec![PeerConfig {
-            name: "existing".into(),
-            ssh_command: "ssh existing".into(),
-        }];
-        merge_peer(
-            &mut peers,
-            PeerConfig {
-                name: "new".into(),
-                ssh_command: "ssh new".into(),
-            },
-        );
-        merge_peer(
-            &mut peers,
-            PeerConfig {
-                name: "existing-renamed".into(),
-                ssh_command: "ssh existing".into(),
-            },
-        );
-
-        assert_eq!(
-            peers,
-            vec![
-                PeerConfig {
-                    name: "existing-renamed".into(),
-                    ssh_command: "ssh existing".into(),
-                },
-                PeerConfig {
-                    name: "new".into(),
-                    ssh_command: "ssh new".into(),
-                },
-            ]
-        );
-    }
-}
+mod tests;

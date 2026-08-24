@@ -24,6 +24,8 @@ pub struct Config {
     pub peers: Vec<PeerConfig>,
     pub max_bytes: u64,
     pub poll_interval_ms: u64,
+    #[serde(default)]
+    pub headless_x11: bool,
 }
 
 impl Default for Config {
@@ -36,6 +38,7 @@ impl Default for Config {
             peers: Vec::new(),
             max_bytes: 256 * 1024 * 1024,
             poll_interval_ms: 75,
+            headless_x11: false,
         }
     }
 }
@@ -123,6 +126,7 @@ pub struct Paths {
     pub log: PathBuf,
     pub binary: PathBuf,
     pub service: PathBuf,
+    pub headless_service: PathBuf,
 }
 
 pub fn paths() -> Result<Paths> {
@@ -150,6 +154,7 @@ pub fn paths() -> Result<Paths> {
         state_dir,
         binary: home.join(".local/bin/ssh-clipboard"),
         service,
+        headless_service: home.join(".config/systemd/user/ssh-clipboard-xvfb.service"),
     })
 }
 
@@ -198,5 +203,14 @@ mod tests {
             ..Config::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn older_configs_default_to_a_native_display() {
+        let config = Config::default();
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("headless_x11");
+        let decoded: Config = serde_json::from_value(value).unwrap();
+        assert!(!decoded.headless_x11);
     }
 }

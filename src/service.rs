@@ -10,6 +10,7 @@ use tokio::process::Command;
 use crate::config::{ensure_private_dir, paths};
 
 const LABEL: &str = "dev.ssh-clipboard";
+const MANAGED_MARKER: &str = "# Managed by ssh-clipboard; use the CLI instead of editing this file.";
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
@@ -22,6 +23,12 @@ pub enum Action {
 pub enum InstallOutcome {
     Running,
     PendingLogin,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InstallOptions {
+    pub headless_x11: bool,
+    pub reset_display: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +57,7 @@ impl InstallOutcome {
     }
 }
 
-pub async fn install(binary: &Path) -> Result<InstallOutcome> {
+pub async fn install(binary: &Path, options: InstallOptions) -> Result<InstallOutcome> {
     if !binary.is_absolute() {
         bail!("service binary path must be absolute");
     }
@@ -60,19 +67,44 @@ pub async fn install(binary: &Path) -> Result<InstallOutcome> {
         tokio::fs::create_dir_all(parent).await?;
     }
     ensure_private_dir(&paths.state_dir)?;
+    if options.headless_x11 && !cfg!(target_os = "linux") {
+        bail!("managed Xvfb is supported only on Linux");
+    }
+    let xvfb = if options.headless_x11 {
+        Some(xvfb_binary().await?)
+    } else {
+        None
+    };
+    let preserved_display = if cfg!(target_os = "linux") && !options.headless_x11 && !options.reset_display {
+        existing_display_directive(&paths.service).await?
+    } else {
+        None
+    };
     let contents = if cfg!(target_os = "macos") {
         launch_agent(binary, &paths.log)
     } else if cfg!(target_os = "linux") {
-        systemd_unit(binary)
+        systemd_unit(binary, options.headless_x11, preserved_display.as_deref())
     } else {
         bail!("background services are supported on macOS and Linux");
     };
     let already_healthy = check_health(&paths.socket, &expected_version).await.is_ok();
+    if xvfb.is_some() {
+        protect_existing_xvfb(&paths.headless_service).await?;
+    }
     write_atomic(&paths.service, contents.as_bytes()).await?;
+    if let Some(xvfb) = xvfb {
+        write_atomic(&paths.headless_service, xvfb_unit(&xvfb).as_bytes()).await?;
+    }
     let outcome = if cfg!(target_os = "macos") {
         start_macos(&paths.service, already_healthy).await
     } else {
-        start_linux(already_healthy).await
+        start_linux(
+            already_healthy,
+            options.headless_x11,
+            options.reset_display,
+            &paths.headless_service,
+        )
+        .await
     }?;
     if outcome == InstallOutcome::Running {
         wait_until_healthy(&paths.socket, &expected_version).await?;
@@ -119,19 +151,50 @@ fn launch_agent(binary: &Path, log: &Path) -> String {
     )
 }
 
-fn systemd_unit(binary: &Path) -> String {
+fn systemd_unit(binary: &Path, headless_x11: bool, preserved_display: Option<&str>) -> String {
     let binary = systemd_quote(&binary.display().to_string());
+    let companion = if headless_x11 {
+        "Wants=ssh-clipboard-xvfb.service\nAfter=ssh-clipboard-xvfb.service"
+    } else {
+        "After=graphical-session.target"
+    };
+    let display = if headless_x11 {
+        "Environment=DISPLAY=:99\nPassEnvironment=XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS".to_owned()
+    } else if let Some(directive) = preserved_display {
+        format!("{directive}\nPassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS")
+    } else {
+        "PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS".to_owned()
+    };
     format!(
         r"[Unit]
 Description=Native encrypted clipboard sync over SSH
-After=graphical-session.target
+{companion}
 
 [Service]
 Type=simple
 ExecStart={binary} daemon
 Restart=always
 RestartSec=1
-PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+{display}
+
+[Install]
+WantedBy=default.target
+"
+    )
+}
+
+fn xvfb_unit(binary: &Path) -> String {
+    let binary = systemd_quote(&binary.display().to_string());
+    format!(
+        r"{MANAGED_MARKER}
+[Unit]
+Description=Private virtual X11 display for ssh-clipboard
+
+[Service]
+Type=simple
+ExecStart={binary} :99 -screen 0 1280x720x24 -nolisten tcp -noreset
+Restart=on-failure
+RestartSec=1
 
 [Install]
 WantedBy=default.target
@@ -173,7 +236,12 @@ async fn start_macos(service_path: &Path, already_healthy: bool) -> Result<Insta
     Ok(InstallOutcome::Running)
 }
 
-async fn start_linux(already_healthy: bool) -> Result<InstallOutcome> {
+async fn start_linux(
+    already_healthy: bool,
+    headless_x11: bool,
+    reset_display: bool,
+    headless_service: &Path,
+) -> Result<InstallOutcome> {
     if !command_succeeds("systemctl", &["--user", "show-environment"]).await? {
         return Ok(InstallOutcome::PendingLogin);
     }
@@ -190,6 +258,18 @@ async fn start_linux(already_healthy: bool) -> Result<InstallOutcome> {
     )
     .await;
     run("systemctl", &["--user", "daemon-reload"]).await?;
+    if headless_x11 {
+        run("systemctl", &["--user", "enable", "ssh-clipboard-xvfb.service"]).await?;
+        run("systemctl", &["--user", "restart", "ssh-clipboard-xvfb.service"]).await?;
+    } else if reset_display && is_managed_xvfb(headless_service).await? {
+        let _ = run(
+            "systemctl",
+            &["--user", "disable", "--now", "ssh-clipboard-xvfb.service"],
+        )
+        .await;
+        tokio::fs::remove_file(headless_service).await?;
+        run("systemctl", &["--user", "daemon-reload"]).await?;
+    }
     run("systemctl", &["--user", "enable", "ssh-clipboard.service"]).await?;
     let active = command_succeeds(
         "systemctl",
@@ -206,6 +286,55 @@ async fn start_linux(already_healthy: bool) -> Result<InstallOutcome> {
         }
     }
     Ok(InstallOutcome::Running)
+}
+
+async fn existing_display_directive(service: &Path) -> Result<Option<String>> {
+    let Ok(contents) = tokio::fs::read_to_string(service).await else {
+        return Ok(None);
+    };
+    Ok(contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        (trimmed.starts_with("Environment=DISPLAY=") || trimmed.starts_with("Environment=\"DISPLAY="))
+            .then(|| trimmed.to_owned())
+    }))
+}
+
+async fn protect_existing_xvfb(service: &Path) -> Result<()> {
+    if service.is_file() && !is_managed_xvfb(service).await? {
+        bail!(
+            "{} already exists and is not managed by ssh-clipboard; it was left unchanged",
+            service.display()
+        );
+    }
+    if Path::new("/tmp/.X11-unix/X99").exists() && !service.is_file() {
+        bail!("X display :99 is already in use; the existing display was left unchanged");
+    }
+    Ok(())
+}
+
+async fn is_managed_xvfb(service: &Path) -> Result<bool> {
+    match tokio::fs::read_to_string(service).await {
+        Ok(contents) => Ok(contents.lines().next() == Some(MANAGED_MARKER)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn xvfb_binary() -> Result<PathBuf> {
+    let output = Command::new("sh")
+        .args(["-c", "command -v Xvfb"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("find Xvfb")?;
+    if !output.status.success() {
+        bail!("Xvfb is not installed; install it with your system package manager, then retry");
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+    if !path.is_absolute() {
+        bail!("Xvfb resolved to a non-absolute path");
+    }
+    Ok(path)
 }
 
 const fn reconcile_action(loaded: bool, healthy: bool) -> ReconcileAction {
@@ -326,8 +455,41 @@ mod tests {
     fn service_documents_escape_paths() {
         let plist = launch_agent(Path::new("/Users/a&b/tool"), Path::new("/tmp/a&b.log"));
         assert!(plist.contains("/Users/a&amp;b/tool"));
-        let unit = systemd_unit(Path::new("/home/me/My Tools/tool"));
+        let unit = systemd_unit(Path::new("/home/me/My Tools/tool"), false, None);
         assert!(unit.contains("ExecStart=\"/home/me/My Tools/tool\" daemon"));
+    }
+
+    #[test]
+    fn headless_service_is_local_only_and_orders_the_clipboard_after_it() {
+        let unit = systemd_unit(Path::new("/home/me/tool"), true, None);
+        assert!(unit.contains("Wants=ssh-clipboard-xvfb.service"));
+        assert!(unit.contains("Environment=DISPLAY=:99"));
+        let xvfb = xvfb_unit(Path::new("/usr/bin/Xvfb"));
+        assert!(xvfb.contains("ExecStart=\"/usr/bin/Xvfb\" :99"));
+        assert!(xvfb.contains("-nolisten tcp"));
+        assert!(!xvfb.contains(" -ac"));
+    }
+
+    #[test]
+    fn existing_display_directives_survive_service_reconciliation() {
+        let unit = systemd_unit(Path::new("/home/me/tool"), false, Some("Environment=DISPLAY=:42"));
+        assert!(unit.contains("Environment=DISPLAY=:42"));
+        assert!(!unit.contains("Environment=DISPLAY=:99"));
+    }
+
+    #[tokio::test]
+    async fn foreign_xvfb_units_are_never_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = directory.path().join("ssh-clipboard-xvfb.service");
+        tokio::fs::write(&service, "[Service]\nExecStart=/custom/Xvfb :99\n")
+            .await
+            .unwrap();
+        let error = protect_existing_xvfb(&service).await.unwrap_err();
+        assert!(error.to_string().contains("left unchanged"));
+        assert_eq!(
+            tokio::fs::read_to_string(service).await.unwrap(),
+            "[Service]\nExecStart=/custom/Xvfb :99\n"
+        );
     }
 
     #[test]
