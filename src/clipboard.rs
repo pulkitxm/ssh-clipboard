@@ -14,6 +14,8 @@ use crate::{filebundle, filebundle::BUNDLE_FORMAT};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod native_formats;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -223,7 +225,11 @@ impl NativeClipboard {
             contents.push(ClipboardContent::Files(native_files));
         } else {
             let mut added_files = false;
-            for representation in representations {
+            #[cfg(target_os = "macos")]
+            let representations = native_formats::for_macos(representations);
+            #[cfg(target_os = "linux")]
+            let representations = representations.to_vec();
+            for representation in &representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
                     || is_sensitive_marker(&representation.format)
